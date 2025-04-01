@@ -52,6 +52,7 @@ var (
 	// installationIDs is an LRU cache of recently used GitHub App installlations IDs.
 	installationIDs, _ = lru.New2Q[string, int64](200)
 	trustPolicies      = expirablelru.NewLRU[cacheTrustPolicyKey, string](200, nil, time.Minute*5)
+	authzPolicies      = expirablelru.NewLRU[cacheTrustPolicyKey, string](200, nil, time.Minute*5)
 )
 
 type sts struct {
@@ -61,6 +62,7 @@ type sts struct {
 	ceclient cloudevents.Client
 	domain   string
 	metrics  bool
+	orgAuthz bool
 }
 
 type cacheTrustPolicyKey struct {
@@ -132,6 +134,13 @@ func (s *sts) Exchange(ctx context.Context, request *pboidc.ExchangeRequest) (_ 
 	e.Actor = Actor{
 		Issuer:  tok.Issuer,
 		Subject: tok.Subject,
+	}
+
+	if s.orgAuthz {
+		// Look for authorization policies that match the incoming request.
+		if err := s.lookupOrgAuthz(ctx, request.Scope, request.Identity); err != nil {
+			return nil, err
+		}
 	}
 
 	e.InstallationID, e.TrustPolicy, err = s.lookupInstallAndTrustPolicy(ctx, request.Scope, request.Identity)
@@ -328,6 +337,105 @@ func (s *sts) lookupTrustPolicy(ctx context.Context, install int64, trustPolicyK
 	}
 
 	return nil
+}
+
+func (s *sts) lookupAuthzPolicy(ctx context.Context, install int64, owner string, token *oidc.IDToken) error {
+	atr := ghinstallation.NewFromAppsTransport(s.atr, install)
+	// We only need to read from the org-level repository, so create that token to fetch
+	// the trust policy.
+	atr.InstallationTokenOptions = &github.InstallationTokenOptions{
+		Repositories: []string{".github"},
+		Permissions: &github.InstallationPermissions{
+			Contents: ptr("read"),
+		},
+	}
+	client := github.NewClient(&http.Client{
+		Transport: atr,
+	})
+	// Once we have looked up the trust policy we should revoke the token.
+	defer func() {
+		tok, err := atr.Token(ctx)
+		if err != nil {
+			clog.WarnContextf(ctx, "failed to get token for revocation: %v", err)
+			return
+		}
+		if err := Revoke(ctx, tok); err != nil {
+			clog.WarnContextf(ctx, "failed to revoke token: %v", err)
+			return
+		}
+	}()
+
+	_, dir, _, err := client.Repositories.GetContents(ctx, owner, ".github", ".github/chainguard",
+		&github.RepositoryContentGetOptions{ /* defaults to the default branch */ },
+	)
+	if err != nil {
+		clog.InfoContextf(ctx, "failed to find authz policies: %v", err)
+		// Don't leak the error to the client.
+		return status.Errorf(codes.NotFound, "unable to find authz policy for %q", owner)
+	}
+
+	for _, d := range dir {
+		if !strings.HasSuffix(d.GetName(), ".allowed.yaml") {
+			continue
+		}
+
+		key := cacheTrustPolicyKey{
+			owner:    owner,
+			repo:     ".github",
+			identity: d.GetName(),
+		}
+
+		raw := ""
+		if cachedRawPolicy, ok := authzPolicies.Get(key); ok {
+			clog.InfoContextf(ctx, "found authz policy in cache for %s", key)
+			raw = cachedRawPolicy
+		}
+		// if is not cached will get the policy from the api
+		if raw == "" {
+			file, _, _, err := client.Repositories.GetContents(ctx,
+				key.owner, key.repo,
+				d.GetPath(),
+				&github.RepositoryContentGetOptions{ /* defaults to the default branch */ },
+			)
+			if err != nil {
+				clog.InfoContextf(ctx, "failed to find authz policy: %v", err)
+				// Don't leak the error to the client.
+				return status.Errorf(codes.NotFound, "unable to find trust policy for %q", key.identity)
+			}
+
+			raw, err = file.GetContent()
+			if err != nil {
+				clog.ErrorContextf(ctx, "failed to read trust policy: %v", err)
+				// Don't leak the error to the client.
+				return status.Errorf(codes.NotFound, "unable to read authz policy found for %q", key.identity)
+			}
+
+			if evicted := authzPolicies.Add(key, raw); evicted {
+				clog.InfoContextf(ctx, "evicted cachekey %s", key)
+			}
+		}
+
+		tp := new(TrustPolicy)
+		if err := yaml.UnmarshalStrict([]byte(raw), tp); err != nil {
+			clog.InfoContextf(ctx, "failed to parse trust policy: %v", err)
+			// Don't leak the error to the client.
+			return status.Errorf(codes.NotFound, "unable to parse trust policy found for %q", key.identity)
+		}
+		if err := tp.Compile(); err != nil {
+			clog.InfoContextf(ctx, "failed to compile trust policy: %v", err)
+			// Don't leak the error to the client.
+			return status.Errorf(codes.NotFound, "unable to compile trust policy found for %q", key.identity)
+		}
+
+		// Validate token against authz policy.
+		if _, err := tp.CheckToken(token, s.domain); err == nil {
+			// If successfully validated, return success
+			return nil
+		}
+	}
+
+	// Found no valid policy, return failure.
+	return status.Errorf(codes.PermissionDenied, "no matching authorization policy found for %q", owner)
 }
 
 // ExchangeRefreshToken implements pboidc.SecurityTokenServiceServer
